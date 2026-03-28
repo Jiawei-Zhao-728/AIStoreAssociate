@@ -77,7 +77,7 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
 
 ```bash
 git clone https://github.com/your-username/ai-store-associate
-cd ai-store-associate
+cd AiStoreAssociate
 npm install
 ```
 
