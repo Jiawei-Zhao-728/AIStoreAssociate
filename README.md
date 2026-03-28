@@ -4,7 +4,7 @@
 
 ![Demo](https://img.shields.io/badge/status-hackathon%20MVP-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Built with](https://img.shields.io/badge/built%20with-Gemini%20API-blue)
+![Built with](https://img.shields.io/badge/built%20with-Vertex%20AI-orange)
 
 ---
 
@@ -14,7 +14,7 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
 
 **AI Store Associate** solves this by letting customers describe their need conversationally:
 
-> *"I need a gift for my dad who loves Italian cooking, under $50"*
+> _"I need a gift for my dad who loves Italian cooking, under $50"_
 
 ...and getting back 3 relevant product recommendations, each with a personalized reason why it fits.
 
@@ -24,7 +24,7 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
 
 - **Natural language shopping** — describe what you need, who it's for, your budget, any constraints
 - **Clarifying questions** — the AI asks one smart follow-up when it needs more context, just like a real associate
-- **Personalized reasoning** — every recommendation explains *why* it fits this specific customer's request
+- **Personalized reasoning** — every recommendation explains _why_ it fits this specific customer's request
 - **Refinement loop** — follow up with "show me cheaper options" or "actually he's vegetarian" and the results update
 - **Catalog-grounded** — the AI only recommends real products from your inventory, no hallucinated items
 
@@ -32,11 +32,11 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
 
 ## 🎥 Demo
 
-| Customer says | AI recommends |
-|---|---|
-| "Gift for dad, loves Italian cooking, under $50" | Pasta maker attachment, cast iron grill pan, olive oil tasting set — each with a tailored reason |
-| "Running shoes for someone with flat feet, mostly road running" | Stability shoes matched to pronation type and surface |
-| "Something fun for a 6-year-old who likes dinosaurs" | Age-appropriate picks filtered to the toy catalog |
+| Customer says                                                   | AI recommends                                                                                    |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| "Gift for dad, loves Italian cooking, under $50"                | Pasta maker attachment, cast iron grill pan, olive oil tasting set — each with a tailored reason |
+| "Running shoes for someone with flat feet, mostly road running" | Stability shoes matched to pronation type and surface                                            |
+| "Something fun for a 6-year-old who likes dinosaurs"            | Age-appropriate picks filtered to the toy catalog                                                |
 
 ---
 
@@ -54,15 +54,23 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
           │                      │
           ▼                      │
 ┌─────────────────────────────────────────────┐
-│           Gemini API (gemini-2.0-flash)      │
-│  System prompt contains:                    │
-│  • Store persona                            │
-│  • Full product catalog (JSON)              │
-│  • Response format instructions             │
+│        Backend API (Cloud Run, Node)         │
+│  • Loads catalog (JSON)                      │
+│  • Builds system prompt                      │
+│  • Calls Vertex AI                           │
+│  • Validates JSON and grounds to catalog     │
+└─────────┬────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────┐
+│        Vertex AI (Gemini/Claude on GCP)      │
+│  Models via Model Garden (e.g.,              │
+│  publishers/anthropic/claude-3.5-sonnet      │
+│  or gemini-1.5-pro)                          │
 └─────────────────────────────────────────────┘
 ```
 
-**For production scale**, replace the in-prompt catalog with vector embeddings (e.g. Vertex AI Vector Search, pgvector) to support catalogs of 10,000+ products via semantic search before passing candidates to Gemini.
+**For production scale**, replace the in-prompt catalog with embeddings-based retrieval on Google Cloud (Vertex AI Matching Engine or Cloud SQL/Postgres + pgvector). Retrieve top‑k candidates server‑side before calling Vertex AI.
 
 ---
 
@@ -71,13 +79,15 @@ Traditional e-commerce search is broken for discovery. Filters and keyword searc
 ### Prerequisites
 
 - Node.js 18+
-- A [Google AI Studio API key](https://aistudio.google.com/app/apikey)
+- A Google Cloud project with billing/credits
+- gcloud CLI installed and authenticated
+- Vertex AI and Secret Manager APIs enabled
 
 ### Installation
 
 ```bash
 git clone https://github.com/your-username/ai-store-associate
-cd AiStoreAssociate
+cd ai-store-associate
 npm install
 ```
 
@@ -87,10 +97,17 @@ npm install
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` for local development (server uses ADC or a service account in production):
 
 ```env
-GEMINI_API_KEY=your_api_key_here
+GCP_PROJECT_ID=your_project_id
+GCP_LOCATION=us-central1
+# Choose one model:
+VERTEX_MODEL_ID=gemini-1.5-pro
+# or: VERTEX_MODEL_ID=publishers/anthropic/models/claude-3.5-sonnet
+
+# Optional for local dev with a service account:
+# GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/service-account.json
 ```
 
 ### Run
@@ -115,7 +132,9 @@ ai-store-associate/
 │   ├── data/
 │   │   └── catalog.json          # Product inventory (name, price, tags, description)
 │   ├── lib/
-│   │   └── gemini.js             # Gemini API wrapper + system prompt builder
+│   │   └── vertex.js             # Vertex AI client + system prompt builder
+│   ├── server/
+│   │   └── index.js              # Cloud Run API (catalog load, call Vertex, validate/ground)
 │   └── App.jsx
 ├── .env.example
 ├── package.json
@@ -129,11 +148,14 @@ ai-store-associate/
 The core of the project is the system prompt. Here's the pattern:
 
 ```js
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { VertexAI } from "@google-cloud/vertexai";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const vertex = new VertexAI({
+  project: process.env.GCP_PROJECT_ID,
+  location: process.env.GCP_LOCATION || "us-central1",
+});
 
-const buildSystemPrompt = (catalog) => `
+export const buildSystemPrompt = (catalog) => `
 You are a helpful and knowledgeable store associate for [Store Name].
 
 Your product catalog is:
@@ -162,16 +184,18 @@ Respond in this JSON format:
 }
 `;
 
-export async function getRecommendations(catalog, conversationHistory) {
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash",
+export async function getRecommendations({ catalog, history, userMessage }) {
+  const model = vertex.getGenerativeModel({
+    model: process.env.VERTEX_MODEL_ID || "gemini-1.5-pro",
     systemInstruction: buildSystemPrompt(catalog),
   });
-
-  const chat = model.startChat({ history: conversationHistory });
-  const lastMessage = conversationHistory.at(-1).parts[0].text;
-  const result = await chat.sendMessage(lastMessage);
-  return result.response.text();
+  const contents = [
+    ...(history || []),
+    { role: "user", parts: [{ text: userMessage }] },
+  ];
+  const resp = await model.generateContent({ contents });
+  const text = resp.response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return text;
 }
 ```
 
@@ -179,13 +203,13 @@ export async function getRecommendations(catalog, conversationHistory) {
 
 ## 🛠️ Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Frontend | React + Tailwind CSS |
-| AI | Gemini API (`gemini-2.0-flash`) |
-| AI SDK | `@google/generative-ai` |
-| Product data | Static JSON (swap for any DB or API) |
-| Deployment | Vercel / Netlify |
+| Layer          | Technology                                              |
+| -------------- | ------------------------------------------------------- |
+| Frontend       | React + Tailwind CSS                                    |
+| AI             | Vertex AI (Gemini or Anthropic Claude via Model Garden) |
+| AI SDK         | `@google-cloud/vertexai`                                |
+| Product data   | Static JSON → Cloud SQL/AlloyDB or Matching Engine      |
+| Hosting/Deploy | Firebase Hosting (frontend) + Cloud Run (API)           |
 
 ---
 
@@ -219,16 +243,16 @@ export async function getRecommendations(catalog, conversationHistory) {
 - **Vector search** — embed product descriptions with Google's `text-embedding-004` model and use Vertex AI Vector Search for semantic retrieval at scale
 - **Inventory awareness** — surface stock levels and flag low-inventory items
 - **Personalization** — store past purchases and preferences across sessions
-- **Multi-modal** — let customers upload a photo ("find me something like this") using Gemini's native vision capabilities
+- **Multi-modal** — let customers upload a photo ("find me something like this") using Gemini’s vision via Vertex AI
 - **A/B testing** — log which recommendations lead to add-to-cart events and fine-tune the prompt accordingly
 
 ---
 
 ## 🏆 Hackathon Notes
 
-This project was built as an MVP for a Google AI hackathon. The goal was to demonstrate that conversational, intent-aware product discovery is both feasible and significantly better than keyword search — using only a well-crafted system prompt and a static product catalog.
+This project was built as an MVP for a Google Cloud hackathon. The goal was to demonstrate that conversational, intent-aware product discovery is both feasible and significantly better than keyword search — using only a well-crafted system prompt and a static product catalog.
 
-**Key insight:** The quality of the *reasoning* shown to the customer (not just the product match) is what drives trust and conversion. Gemini's ability to tie recommendations back to specific things the customer said is the core differentiator.
+**Key insight:** The quality of the _reasoning_ shown to the customer (not just the product match) is what drives trust and conversion. Vertex AI models’ ability to tie recommendations back to specific things the customer said is the core differentiator.
 
 ---
 
@@ -240,4 +264,4 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ## 🙏 Acknowledgements
 
-Built with the [Google Gemini API](https://ai.google.dev). Inspired by the gap between how people naturally shop in stores vs. how they're forced to search online.
+Built with Google Cloud Vertex AI. Inspired by the gap between how people naturally shop in stores vs. how they're forced to search online.
